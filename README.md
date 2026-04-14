@@ -2,7 +2,7 @@
 
 `nomad-mcp` is a read-only MCP server for HashiCorp Nomad built with the official Go MCP SDK and the official Nomad API client.
 
-> **[!NOTE]** 
+> [!NOTE]
 > This project was developed via agentic / vibe coding
 
 ## Scope
