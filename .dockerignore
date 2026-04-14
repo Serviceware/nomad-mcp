@@ -1,0 +1,6 @@
+.git
+.vscode
+nomad-mcp
+coverage.out
+dist
+bin

@@ -1,0 +1,13 @@
+{
+	"servers": {
+		"nomad-mcp-test": {
+			"type": "stdio",
+			"command": "go",
+			"args": [
+				"run",
+				"./cmd/nomad-mcp"
+			]
+		}
+	},
+	"inputs": []
+}
