@@ -99,6 +99,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 				"datacenters":      job.Datacenters,
 				"meta":             job.Meta,
 				"task_group_count": len(job.TaskGroups),
+				"task_groups":      taskGroupsMap(job.TaskGroups),
 			},
 			"summary": map[string]any{
 				"job_id":    summary.JobID,
