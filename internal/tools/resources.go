@@ -650,17 +650,25 @@ func nodeResourcesMap(node *api.Node) map[string]any {
 		return map[string]any{}
 	}
 
-	availableCPU := node.NodeResources.Cpu.CpuShares - int64(node.ReservedResources.Cpu.CpuShares)
-	availableMemoryMB := node.NodeResources.Memory.MemoryMB - int64(node.ReservedResources.Memory.MemoryMB)
-	availableDiskMB := node.NodeResources.Disk.DiskMB - int64(node.ReservedResources.Disk.DiskMB)
+	// ReservedResources is nil on nodes with no reserved resources; treat reserved as 0.
+	var reservedCPU, reservedMemoryMB, reservedDiskMB uint64
+	if node.ReservedResources != nil {
+		reservedCPU = node.ReservedResources.Cpu.CpuShares
+		reservedMemoryMB = node.ReservedResources.Memory.MemoryMB
+		reservedDiskMB = node.ReservedResources.Disk.DiskMB
+	}
+
+	availableCPU := node.NodeResources.Cpu.CpuShares - int64(reservedCPU)
+	availableMemoryMB := node.NodeResources.Memory.MemoryMB - int64(reservedMemoryMB)
+	availableDiskMB := node.NodeResources.Disk.DiskMB - int64(reservedDiskMB)
 
 	return map[string]any{
 		"cpu_shares":           node.NodeResources.Cpu.CpuShares,
 		"memory_mb":            node.NodeResources.Memory.MemoryMB,
 		"disk_mb":              node.NodeResources.Disk.DiskMB,
-		"reserved_cpu_shares":  node.ReservedResources.Cpu.CpuShares,
-		"reserved_memory_mb":   node.ReservedResources.Memory.MemoryMB,
-		"reserved_disk_mb":     node.ReservedResources.Disk.DiskMB,
+		"reserved_cpu_shares":  reservedCPU,
+		"reserved_memory_mb":   reservedMemoryMB,
+		"reserved_disk_mb":     reservedDiskMB,
 		"available_cpu_shares": availableCPU,
 		"available_memory_mb":  availableMemoryMB,
 		"available_disk_mb":    availableDiskMB,

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"testing"
@@ -27,10 +28,20 @@ func (fakeNomadClient) ListNodes(query *api.QueryOptions) ([]*api.NodeListStub, 
 	return []*api.NodeListStub{{ID: "node-1", Name: "node-1", Datacenter: "dc1", NodePool: "default", Status: "ready"}}, &api.QueryMeta{}, nil
 }
 func (fakeNomadClient) GetNode(nodeID string, query *api.QueryOptions) (*api.Node, *api.QueryMeta, error) {
-	return &api.Node{ID: nodeID, Name: "node-1", Datacenter: "dc1", NodePool: "default", Status: "ready", Attributes: map[string]string{}, Meta: map[string]string{}, Drivers: map[string]*api.DriverInfo{}}, &api.QueryMeta{}, nil
+	// NodeResources is populated but ReservedResources is deliberately left nil to
+	// exercise the no-reserved-resources path in nodeResourcesMap (regression guard).
+	return &api.Node{
+		ID: nodeID, Name: "node-1", Datacenter: "dc1", NodePool: "default", Status: "ready",
+		Attributes: map[string]string{}, Meta: map[string]string{}, Drivers: map[string]*api.DriverInfo{},
+		NodeResources: &api.NodeResources{
+			Cpu:    api.NodeCpuResources{CpuShares: 4000},
+			Memory: api.NodeMemoryResources{MemoryMB: 8192},
+			Disk:   api.NodeDiskResources{DiskMB: 50000},
+		},
+	}, &api.QueryMeta{}, nil
 }
 func (fakeNomadClient) ListNodeAllocations(nodeID string, query *api.QueryOptions) ([]*api.Allocation, *api.QueryMeta, error) {
-	return []*api.Allocation{}, &api.QueryMeta{}, nil
+	return []*api.Allocation{{ID: "alloc-1", Namespace: "default", NodeID: nodeID, JobID: "example", ClientStatus: "running"}}, &api.QueryMeta{}, nil
 }
 func (fakeNomadClient) ListJobs(query *api.QueryOptions) ([]*api.JobListStub, *api.QueryMeta, error) {
 	return []*api.JobListStub{{ID: "example", Name: "example", Namespace: "default", Type: "service", Status: "running", Meta: map[string]string{"department": "financial", "team": "platform"}}}, &api.QueryMeta{}, nil
@@ -93,6 +104,30 @@ func (fakeNomadClient) ListAllocationServices(allocationID string, query *api.Qu
 }
 func (fakeNomadClient) GetAllocationLogs(allocationID string, taskName string, logType string, lines int, query *api.QueryOptions) (*client.AllocationLogTail, error) {
 	return &client.AllocationLogTail{Text: "example log line\n", RequestedLines: lines, AppliedLines: lines, ReturnedBytes: len("example log line\n"), Truncated: false, LogType: logType, TaskName: taskName}, nil
+}
+
+// newTestSession wires an in-process MCP client to a server backed by fakeNomadClient
+// and returns a connected client session plus a context bounded to the test.
+func newTestSession(t *testing.T) (*mcp.ClientSession, context.Context) {
+	t.Helper()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(fakeNomadClient{}, logger)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
+
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	must.NoError(t, err)
+	t.Cleanup(func() { serverSession.Close() })
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	must.NoError(t, err)
+	t.Cleanup(func() { clientSession.Close() })
+
+	return clientSession, ctx
 }
 
 func TestServerListsToolsAndCallsClusterStatus(t *testing.T) {
@@ -186,6 +221,58 @@ func TestListJobsIncludesMetadataForDiscovery(t *testing.T) {
 	must.True(t, ok)
 	must.Eq(t, "financial", meta["department"])
 	must.Eq(t, "platform", meta["team"])
+}
+
+func TestGetNodeAllocationCountIsNumeric(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "get_node", Arguments: map[string]any{"node_id": "node-1"}})
+	must.NoError(t, err)
+	must.False(t, result.IsError)
+
+	structured, ok := result.StructuredContent.(map[string]any)
+	must.True(t, ok)
+
+	allocations, ok := structured["allocations"].(map[string]any)
+	must.True(t, ok)
+
+	// count must be the number of allocations, not the slice of IDs (regression guard).
+	count, ok := allocations["count"].(float64)
+	must.True(t, ok)
+	must.Eq(t, float64(1), count)
+
+	ids, ok := allocations["ids"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, ids)
+}
+
+func TestNodeStatusResourceHandlesNilReservedResources(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	// The fake node has NodeResources but a nil ReservedResources; reading its status
+	// must not panic and must report reserved as zero with available == total.
+	resource, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://nodes/node-1/status"})
+	must.NoError(t, err)
+	must.Positive(t, len(resource.Contents))
+
+	var payload struct {
+		Node struct {
+			Resources struct {
+				CPUShares          int64 `json:"cpu_shares"`
+				ReservedCPUShares  int64 `json:"reserved_cpu_shares"`
+				AvailableCPUShares int64 `json:"available_cpu_shares"`
+			} `json:"resources"`
+		} `json:"node"`
+	}
+	must.NoError(t, json.Unmarshal([]byte(resource.Contents[0].Text), &payload))
+
+	must.Eq(t, int64(4000), payload.Node.Resources.CPUShares)
+	must.Eq(t, int64(0), payload.Node.Resources.ReservedCPUShares)
+	must.Eq(t, int64(4000), payload.Node.Resources.AvailableCPUShares)
 }
 
 func TestListRegionsToolSchemaIncludesProperties(t *testing.T) {

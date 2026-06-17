@@ -163,7 +163,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 				"meta_count":             len(node.Meta),
 			},
 			"allocations": map[string]any{
-				"count": allocationIDs,
+				"count": len(allocationIDs),
 				"ids":   allocationIDs,
 				"meta":  metaMap(allocationsMeta),
 			},
