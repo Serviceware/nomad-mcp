@@ -56,7 +56,13 @@ func registerAllocationTools(server *mcp.Server, nomadClient client.Facade) {
 			return failResult(err), nil, nil
 		}
 
-		services, servicesMeta, err := nomadClient.ListAllocationServices(input.AllocationID, query)
+		// The alloc lookup is namespace-agnostic (IDs are cluster-global), but the
+		// services lookup enforces namespace. Use the allocation's real namespace so
+		// a caller-supplied or wildcard namespace can't turn a found alloc into a
+		// spurious 404.
+		servicesQuery := input.objectQueryInput.queryOptions().WithContext(ctx)
+		servicesQuery.Namespace = allocation.Namespace
+		services, servicesMeta, err := nomadClient.ListAllocationServices(input.AllocationID, servicesQuery)
 		if err != nil {
 			return failResult(err), nil, nil
 		}
