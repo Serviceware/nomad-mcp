@@ -8,5 +8,6 @@ import (
 func Register(server *mcp.Server, nomadClient client.Facade) {
 	registerClusterTools(server, nomadClient)
 	registerJobTools(server, nomadClient)
+	registerJobSpecTools(server, nomadClient)
 	registerAllocationTools(server, nomadClient)
 }
