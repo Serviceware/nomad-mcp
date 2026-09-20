@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,7 +56,66 @@ func (fakeNomadClient) GetJob(jobID string, query *api.QueryOptions) (*api.Job, 
 	stable := true
 	stop := false
 	submitTime := int64(1)
-	return &api.Job{ID: &jobID, Name: &jobName, Namespace: &namespace, Type: &jobType, Priority: &priority, Version: &version, Stable: &stable, Stop: &stop, SubmitTime: &submitTime}, &api.QueryMeta{}, nil
+	status := "running"
+	return &api.Job{
+		ID: &jobID, Name: &jobName, Namespace: &namespace, Type: &jobType, Status: &status,
+		Priority: &priority, Version: &version, Stable: &stable, Stop: &stop, SubmitTime: &submitTime,
+		TaskGroups: []*api.TaskGroup{fakeTaskGroup()},
+	}, &api.QueryMeta{}, nil
+}
+
+// fakeTaskGroup carries the spec detail inspect_job projects: resource requests
+// with and without memory_max, a sensitive env value, a literal secret nested in
+// driver config, and a pure interpolation that must survive redaction.
+func fakeTaskGroup() *api.TaskGroup {
+	name := "cache"
+	count := 2
+	cpu := 500
+	memory := 256
+	memoryMax := 512
+	sidecarCPU := 100
+	sidecarMemory := 64
+	destination := "local/config.json"
+	changeMode := "restart"
+	templateBody := strings.Join([]string{
+		`LOG_LEVEL=info`,
+		`REDIS_PASSWORD=hunter2`,
+		`{{ with secret "kv/redis" }}`,
+		`DB_PASSWORD='{{ .Data.password }}'`,
+		`{{ end }}`,
+		`SSL_KEY_STORE_TYPE=PKCS12`,
+	}, "\n")
+
+	return &api.TaskGroup{
+		Name:  &name,
+		Count: &count,
+		Tasks: []*api.Task{
+			{
+				Name:   "redis",
+				Driver: "docker",
+				Env: map[string]string{
+					"REDIS_ADDR": "127.0.0.1:6379",
+					// Adjacent to a sensitive word but not one: must stay readable.
+					"TOKENEXCHANGE_AUDIENCE": "platform-engine",
+					"apiKeyHeader":           "X-Api-Key: abcdef",
+					"REDIS_PASSWORD":         "hunter2",
+					"VAULT_TOKEN":            "${VAULT_TOKEN}",
+				},
+				Config: map[string]any{
+					"image": "redis:7",
+					"auth":  map[string]any{"username": "deploy", "password": "hunter2"},
+				},
+				Resources: &api.Resources{CPU: &cpu, MemoryMB: &memory, MemoryMaxMB: &memoryMax},
+				Templates: []*api.Template{{DestPath: &destination, ChangeMode: &changeMode, EmbeddedTmpl: &templateBody}},
+			},
+			{
+				Name:      "log-shipper",
+				Driver:    "docker",
+				Lifecycle: &api.TaskLifecycle{Hook: "prestart", Sidecar: true},
+				Resources: &api.Resources{CPU: &sidecarCPU, MemoryMB: &sidecarMemory},
+			},
+		},
+	}
 }
 func (fakeNomadClient) GetJobScaleStatus(jobID string, query *api.QueryOptions) (*api.JobScaleStatusResponse, *api.QueryMeta, error) {
 	return &api.JobScaleStatusResponse{JobID: jobID, Namespace: "default", TaskGroups: map[string]api.TaskGroupScaleStatus{"cache": {Desired: 1, Placed: 1, Running: 1, Healthy: 1, Unhealthy: 0}}}, &api.QueryMeta{}, nil
@@ -369,4 +429,239 @@ func TestListRegionsToolSchemaIncludesProperties(t *testing.T) {
 		t.Fatalf("get_job job_id property has unexpected type %T", getJobProperties["job_id"])
 	}
 	must.Eq(t, "full Nomad job ID", jobIDProperty["description"])
+}
+
+// numberAt reads a JSON number field, which always decodes as float64.
+func numberAt(t *testing.T, source map[string]any, key string) float64 {
+	t.Helper()
+	value, ok := source[key].(float64)
+	must.True(t, ok)
+	return value
+}
+
+func stringAt(t *testing.T, source map[string]any, key string) string {
+	t.Helper()
+	value, ok := source[key].(string)
+	must.True(t, ok)
+	return value
+}
+
+// callInspectJob runs inspect_job and returns its structured output.
+func callInspectJob(t *testing.T, clientSession *mcp.ClientSession, ctx context.Context, arguments map[string]any) map[string]any {
+	t.Helper()
+
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "inspect_job", Arguments: arguments})
+	must.NoError(t, err)
+	must.False(t, result.IsError)
+
+	structured, ok := result.StructuredContent.(map[string]any)
+	must.True(t, ok)
+	return structured
+}
+
+func firstTaskGroup(t *testing.T, structured map[string]any) map[string]any {
+	t.Helper()
+
+	groups, ok := structured["task_groups"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, groups)
+
+	group, ok := groups[0].(map[string]any)
+	must.True(t, ok)
+	return group
+}
+
+func taskByName(t *testing.T, group map[string]any, name string) map[string]any {
+	t.Helper()
+
+	tasks, ok := group["tasks"].([]any)
+	must.True(t, ok)
+
+	for _, candidate := range tasks {
+		task, ok := candidate.(map[string]any)
+		must.True(t, ok)
+		if task["name"] == name {
+			return task
+		}
+	}
+
+	t.Fatalf("task %s not found in task group %v", name, group["name"])
+	return nil
+}
+
+func TestInspectJobReportsResourceTotals(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{"job_id": "example"})
+
+	group := firstTaskGroup(t, structured)
+	must.Eq(t, float64(2), numberAt(t, group, "count"))
+
+	resources, ok := group["resources"].(map[string]any)
+	must.True(t, ok)
+
+	perAllocation, ok := resources["per_allocation"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(320), numberAt(t, perAllocation, "memory_mb"))
+	// The sidecar has no memory_max, so its reservation is also its ceiling.
+	must.Eq(t, float64(576), numberAt(t, perAllocation, "memory_max_mb"))
+
+	desired, ok := resources["desired"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(640), numberAt(t, desired, "memory_mb"))
+	must.Eq(t, float64(1152), numberAt(t, desired, "memory_max_mb"))
+
+	totals, ok := structured["totals"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(2), numberAt(t, totals, "allocations"))
+	must.Eq(t, float64(2), numberAt(t, totals, "tasks"))
+
+	jobTotals, ok := totals["desired"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(640), numberAt(t, jobTotals, "memory_mb"))
+	must.Eq(t, float64(1200), numberAt(t, jobTotals, "cpu_mhz"))
+
+	redis := taskByName(t, group, "redis")
+	taskResources, ok := redis["resources"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(512), numberAt(t, taskResources, "memory_limit_mb"))
+
+	sidecar := taskByName(t, group, "log-shipper")
+	sidecarResources, ok := sidecar["resources"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(0), numberAt(t, sidecarResources, "memory_max_mb"))
+	must.Eq(t, float64(64), numberAt(t, sidecarResources, "memory_limit_mb"))
+}
+
+func TestInspectJobOmitsUnrequestedSectionsButCountsThem(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{"job_id": "example"})
+
+	redis := taskByName(t, firstTaskGroup(t, structured), "redis")
+
+	_, hasEnv := redis["env"]
+	must.False(t, hasEnv)
+	_, hasConfig := redis["config"]
+	must.False(t, hasConfig)
+
+	// The counts are what tell a caller which section is worth requesting.
+	declares, ok := redis["declares"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(5), numberAt(t, declares, "env"))
+	must.Eq(t, float64(1), numberAt(t, declares, "templates"))
+
+	redaction, ok := structured["redaction"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(0), numberAt(t, redaction, "values_redacted"))
+}
+
+func TestInspectJobRedactsSensitiveValues(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{
+		"job_id":   "example",
+		"sections": []any{"env", "config"},
+	})
+
+	redis := taskByName(t, firstTaskGroup(t, structured), "redis")
+
+	env, ok := redis["env"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "<redacted>", stringAt(t, env, "REDIS_PASSWORD"))
+	must.Eq(t, "127.0.0.1:6379", stringAt(t, env, "REDIS_ADDR"))
+	must.Eq(t, "platform-engine", stringAt(t, env, "TOKENEXCHANGE_AUDIENCE"))
+	// camelCase humps split the same way separators do.
+	must.Eq(t, "<redacted>", stringAt(t, env, "apiKeyHeader"))
+	// A pure interpolation names a secret without carrying one.
+	must.Eq(t, "${VAULT_TOKEN}", stringAt(t, env, "VAULT_TOKEN"))
+
+	config, ok := redis["config"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "redis:7", stringAt(t, config, "image"))
+	// The whole auth block goes, not just the password inside it.
+	must.Eq(t, "<redacted>", stringAt(t, config, "auth"))
+
+	redaction, ok := structured["redaction"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(3), numberAt(t, redaction, "values_redacted"))
+}
+
+func TestInspectJobRedactsTemplateBodiesLineByLine(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{
+		"job_id":   "example",
+		"task":     "redis",
+		"sections": []any{"template_bodies"},
+	})
+
+	templates, ok := taskByName(t, firstTaskGroup(t, structured), "redis")["templates"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, templates)
+
+	template, ok := templates[0].(map[string]any)
+	must.True(t, ok)
+	must.True(t, template["reads_vault"].(bool))
+
+	body := stringAt(t, template, "body")
+	// Only the literal secret goes; the structure that explains where the real
+	// values come from stays intact.
+	must.StrContains(t, body, "LOG_LEVEL=info")
+	must.StrContains(t, body, "REDIS_PASSWORD=<redacted>")
+	must.StrContains(t, body, `{{ with secret "kv/redis" }}`)
+	must.StrContains(t, body, `DB_PASSWORD='{{ .Data.password }}'`)
+	// A key ending in a locator word names a format, not a secret.
+	must.StrContains(t, body, "SSL_KEY_STORE_TYPE=PKCS12")
+}
+
+func TestInspectJobFiltersAndReportsUnknownSections(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{
+		"job_id":   "example",
+		"task":     "log-shipper",
+		"sections": []any{"lifecycle", "nonsense"},
+	})
+
+	group := firstTaskGroup(t, structured)
+	tasks, ok := group["tasks"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, tasks)
+
+	sidecar := taskByName(t, group, "log-shipper")
+	lifecycle, ok := sidecar["lifecycle"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "prestart", stringAt(t, lifecycle, "hook"))
+
+	sections, ok := structured["sections"].(map[string]any)
+	must.True(t, ok)
+
+	unknown, ok := sections["unknown"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, unknown)
+	must.Eq(t, "nonsense", unknown[0])
+}
+
+func TestInspectJobFilterOnMissingTaskGroupReturnsNothing(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+	structured := callInspectJob(t, clientSession, ctx, map[string]any{
+		"job_id":     "example",
+		"task_group": "does-not-exist",
+	})
+
+	groups, ok := structured["task_groups"].([]any)
+	must.True(t, ok)
+	must.Len(t, 0, groups)
+
+	totals, ok := structured["totals"].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, float64(0), numberAt(t, totals, "task_groups"))
 }

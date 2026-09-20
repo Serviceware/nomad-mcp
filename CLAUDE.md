@@ -33,7 +33,7 @@ Flow: `cmd/nomad-mcp/main.go` builds the logger and a Nomad client, then calls `
 - **`internal/nomad` — the central abstraction.** `Facade` is an interface enumerating every Nomad API call the server makes; `Client` is the real implementation wrapping `*api.Client`. **Everything downstream depends on `Facade`, not the concrete client.** Adding a new Nomad-backed capability almost always starts by adding a method to `Facade` (and to `fakeNomadClient` in the test). `GetAllocationLogs` is the one method with real logic here (bounds log tails to `maxLogTailLines`).
 - **`internal/server`** — assembles the server and installs `loggingMiddleware` (a `ReceivingMiddleware` that logs each request's method/tool/duration). `server_test.go` drives the full server against an in-process `fakeNomadClient` implementing `Facade`.
 - **`internal/tools`** — all MCP surface area, despite the package name covering tools *and* resources *and* prompts:
-  - `register.go` / `cluster.go` / `jobs.go` / `allocations.go` — tools, registered by domain.
+  - `register.go` / `cluster.go` / `jobs.go` / `jobspec.go` / `allocations.go` — tools, registered by domain. `jobspec.go` holds `inspect_job`, the job-specification projection: section selection, resource totals, and the redaction pass.
   - `resources.go` — registers `nomad://...` resource templates; URIs are parsed and routed in `readNomadResource`.
   - `prompts.go` — registers guided diagnostic prompts that embed resources by URI.
   - `helpers.go` — shared plumbing (see patterns below).
@@ -46,6 +46,7 @@ Flow: `cmd/nomad-mcp/main.go` builds the logger and a Nomad client, then calls `
 - Always thread the request context: call `input.queryOptions().WithContext(ctx)`.
 - Output is a structured `map[string]any` plus a human-readable summary string built with helpers like `summarizeList`, `metaMap`, `metadataSummary`, and the `deref*` pointer helpers.
 - **Read-only is a hard invariant.** Do not add tools/resources that mutate Nomad, stream events, use blocking queries, or follow logs — these are intentionally out of scope.
+- **Specification output is redacted.** Anything in `inspect_job` that echoes user-supplied configuration — task `Env`, driver `Config`, artifact options and headers, template bodies — goes through `redactor`, which hides values under sensitive-looking keys and counts them. Matching is per word with a locator-suffix escape hatch, so ordinary configuration stays readable; see the tests in `internal/server` before loosening or tightening it. New spec surface added to the tool must be routed through the same pass.
 - For discovery questions, `list_jobs` is the preferred entry point; it accepts native Nomad `filter` expressions (e.g. `Meta.department == "financial"`) and returns each job's `meta` map plus a stable `meta_summary` string.
 
 This project is developed via agentic / vibe coding.

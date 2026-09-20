@@ -18,6 +18,7 @@ Supported tools:
 - `get_node`
 - `list_jobs`
 - `get_job`
+- `inspect_job`
 - `get_job_scale_status`
 - `get_job_evaluations`
 - `get_job_allocations`
@@ -29,6 +30,34 @@ Supported tools:
 - `get_allocation_checks`
 
 `list_jobs` now includes each job's `meta` map and a stable `meta_summary` string so clients can answer discovery questions from a single tool call.
+
+### Inspecting a job specification
+
+`get_job` answers how a job is doing; `inspect_job` answers what it declares. It returns
+the submitted specification — the same data as `nomad job inspect` — projected into a
+shape a client can navigate without pulling the whole document.
+
+The base response is always the job, its task groups, its tasks, and their resource
+requests, plus per-group and per-job totals (`per_allocation` and `desired`, the latter
+multiplied by the group count). That covers questions such as how much memory a job is
+allowed to use. An unset `memory_max` is reported as `memory_limit_mb` equal to the
+reservation, which is what Nomad enforces.
+
+Everything else is opt-in through `sections`: `scheduling`, `networking`, `storage`,
+`env`, `config`, `templates`, `template_bodies`, `artifacts`, `identity`, `lifecycle`,
+`meta`, or `all`. Each task reports a `declares` count for the sections it would fill,
+so a caller can see that there are 40 environment variables before asking for them.
+`task_group` and `task` narrow the response further. Unrecognized section names are
+returned in `sections.unknown` rather than silently ignored.
+
+Values whose key contains a sensitive word (`password`, `secret`, `token`, `key`, …) are
+replaced with `<redacted>` and counted in `redaction.values_redacted`; keys always stay
+visible. Matching is per word, so `TOKENEXCHANGE_AUDIENCES` and `KEYCLOAK_URL` are not
+redacted, and a key ending in a locator word (`_PATH`, `_URL`, `_TYPE`, …) is treated as
+pointing at secret material rather than holding it. A value that is nothing but a
+`${...}` or `{{...}}` reference is kept, since it names a secret without carrying one.
+Template bodies are redacted line by line, so the Vault paths and rendering logic that
+make a template worth reading survive.
 
 Supported resources:
 
