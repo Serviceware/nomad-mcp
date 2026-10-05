@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +15,49 @@ import (
 	"github.com/shoenig/test/must"
 )
 
-type fakeNomadClient struct{}
+// observed records the arguments the server actually passed to the Facade, so
+// tests can assert on namespace scoping and ID decoding.
+type observed struct {
+	mu                 sync.Mutex
+	servicesNamespace  string
+	checksNamespace    string
+	logsNamespace      string
+	jobIDs             []string
+	allocationServices int
+}
+
+func (o *observed) snapshot(read func(*observed)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	read(o)
+}
+
+// fakeNomadClient has value receivers so the zero value is usable as a Facade;
+// the optional fields tune the responses and the recorder for individual tests.
+type fakeNomadClient struct {
+	// allocNamespace is the namespace GetAllocation reports; defaults to "default".
+	allocNamespace string
+	// nilLogTail makes GetAllocationLogs return (nil, nil), which a Facade is
+	// allowed to do when no logs are available.
+	nilLogTail bool
+	seen       *observed
+}
+
+func (f fakeNomadClient) namespace() string {
+	if f.allocNamespace == "" {
+		return "default"
+	}
+	return f.allocNamespace
+}
+
+func (f fakeNomadClient) record(write func(*observed)) {
+	if f.seen == nil {
+		return
+	}
+	f.seen.mu.Lock()
+	defer f.seen.mu.Unlock()
+	write(f.seen)
+}
 
 func (fakeNomadClient) Close()                               {}
 func (fakeNomadClient) Address() string                      { return "http://127.0.0.1:4646" }
@@ -46,7 +89,8 @@ func (fakeNomadClient) ListNodeAllocations(nodeID string, query *api.QueryOption
 func (fakeNomadClient) ListJobs(query *api.QueryOptions) ([]*api.JobListStub, *api.QueryMeta, error) {
 	return []*api.JobListStub{{ID: "example", Name: "example", Namespace: "default", Type: "service", Status: "running", Meta: map[string]string{"department": "financial", "team": "platform"}}}, &api.QueryMeta{}, nil
 }
-func (fakeNomadClient) GetJob(jobID string, query *api.QueryOptions) (*api.Job, *api.QueryMeta, error) {
+func (f fakeNomadClient) GetJob(jobID string, query *api.QueryOptions) (*api.Job, *api.QueryMeta, error) {
+	f.record(func(o *observed) { o.jobIDs = append(o.jobIDs, jobID) })
 	jobName := "example"
 	namespace := "default"
 	jobType := "service"
@@ -113,16 +157,25 @@ func (fakeNomadClient) ListDeploymentAllocations(deploymentID string, query *api
 func (fakeNomadClient) ListAllocations(query *api.QueryOptions) ([]*api.AllocationListStub, *api.QueryMeta, error) {
 	return []*api.AllocationListStub{}, &api.QueryMeta{}, nil
 }
-func (fakeNomadClient) GetAllocation(allocationID string, query *api.QueryOptions) (*api.Allocation, *api.QueryMeta, error) {
-	return &api.Allocation{ID: allocationID, Namespace: "default", NodeID: "node-1", NodeName: "node-1", JobID: "example", ClientStatus: "running", TaskStates: map[string]*api.TaskState{"web": {State: "running"}}}, &api.QueryMeta{}, nil
+func (f fakeNomadClient) GetAllocation(allocationID string, query *api.QueryOptions) (*api.Allocation, *api.QueryMeta, error) {
+	return &api.Allocation{ID: allocationID, Namespace: f.namespace(), NodeID: "node-1", NodeName: "node-1", JobID: "example", ClientStatus: "running", TaskStates: map[string]*api.TaskState{"web": {State: "running"}}}, &api.QueryMeta{}, nil
 }
-func (fakeNomadClient) GetAllocationChecks(allocationID string, query *api.QueryOptions) (api.AllocCheckStatuses, error) {
+func (f fakeNomadClient) GetAllocationChecks(allocationID string, query *api.QueryOptions) (api.AllocCheckStatuses, error) {
+	f.record(func(o *observed) { o.checksNamespace = query.Namespace })
 	return api.AllocCheckStatuses{"check-1": {ID: "check-1", Check: "http", Task: "web", Service: "example-http", Status: "success", Timestamp: 1}}, nil
 }
-func (fakeNomadClient) ListAllocationServices(allocationID string, query *api.QueryOptions) ([]*api.ServiceRegistration, *api.QueryMeta, error) {
+func (f fakeNomadClient) ListAllocationServices(allocationID string, query *api.QueryOptions) ([]*api.ServiceRegistration, *api.QueryMeta, error) {
+	f.record(func(o *observed) {
+		o.servicesNamespace = query.Namespace
+		o.allocationServices++
+	})
 	return []*api.ServiceRegistration{}, &api.QueryMeta{}, nil
 }
-func (fakeNomadClient) GetAllocationLogs(allocationID string, taskName string, logType string, lines int, query *api.QueryOptions) (*client.AllocationLogTail, error) {
+func (f fakeNomadClient) GetAllocationLogs(allocationID string, taskName string, logType string, lines int, query *api.QueryOptions) (*client.AllocationLogTail, error) {
+	f.record(func(o *observed) { o.logsNamespace = query.Namespace })
+	if f.nilLogTail {
+		return nil, nil
+	}
 	return &client.AllocationLogTail{Text: "example log line\n", RequestedLines: lines, AppliedLines: lines, ReturnedBytes: len("example log line\n"), Truncated: false, LogType: logType, TaskName: taskName}, nil
 }
 
@@ -130,9 +183,15 @@ func (fakeNomadClient) GetAllocationLogs(allocationID string, taskName string, l
 // and returns a connected client session plus a context bounded to the test.
 func newTestSession(t *testing.T) (*mcp.ClientSession, context.Context) {
 	t.Helper()
+	return newTestSessionWith(t, fakeNomadClient{})
+}
+
+// newTestSessionWith is newTestSession against a specific fake configuration.
+func newTestSessionWith(t *testing.T, fake fakeNomadClient) (*mcp.ClientSession, context.Context) {
+	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := New(fakeNomadClient{}, logger)
+	server := New(fake, logger)
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
@@ -470,4 +529,192 @@ func TestGetJobIncludesTaskGroupsWithNetworksAndTasks(t *testing.T) {
 	must.Eq(t, "agent", agentTask["name"])
 	must.Eq(t, "docker", agentTask["driver"])
 	must.Eq(t, "consul:latest", agentTask["image"])
+}
+
+func TestAllocationResourcesUseAllocationNamespace(t *testing.T) {
+	t.Parallel()
+
+	seen := &observed{}
+	fake := fakeNomadClient{allocNamespace: "financial", seen: seen}
+	clientSession, ctx := newTestSessionWith(t, fake)
+
+	// The alloc lives outside "default"; the services, checks, and logs endpoints
+	// are namespace-scoped and would 404 under the default namespace.
+	status, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://allocs/alloc-1/status"})
+	must.NoError(t, err)
+	must.Positive(t, len(status.Contents))
+
+	checks, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://allocs/alloc-1/checks"})
+	must.NoError(t, err)
+	must.Positive(t, len(checks.Contents))
+
+	logs, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://allocs/alloc-1/logs/web/stdout"})
+	must.NoError(t, err)
+	must.Positive(t, len(logs.Contents))
+
+	seen.snapshot(func(o *observed) {
+		must.Eq(t, "financial", o.servicesNamespace)
+		must.Eq(t, "financial", o.checksNamespace)
+		must.Eq(t, "financial", o.logsNamespace)
+	})
+}
+
+func TestAllocationToolsUseAllocationNamespace(t *testing.T) {
+	t.Parallel()
+
+	seen := &observed{}
+	fake := fakeNomadClient{allocNamespace: "financial", seen: seen}
+	clientSession, ctx := newTestSessionWith(t, fake)
+
+	// A wildcard namespace is valid for the alloc lookup (IDs are cluster-global)
+	// but must not leak into the namespace-scoped follow-up queries.
+	allocation, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "get_allocation",
+		Arguments: map[string]any{"allocation_id": "alloc-1", "namespace": "*"},
+	})
+	must.NoError(t, err)
+	must.False(t, allocation.IsError)
+
+	checks, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "get_allocation_checks",
+		Arguments: map[string]any{"allocation_id": "alloc-1", "namespace": "*"},
+	})
+	must.NoError(t, err)
+	must.False(t, checks.IsError)
+
+	seen.snapshot(func(o *observed) {
+		must.Eq(t, "financial", o.servicesNamespace)
+		must.Eq(t, "financial", o.checksNamespace)
+	})
+}
+
+func TestJobResourcesAcceptSlashInJobID(t *testing.T) {
+	t.Parallel()
+
+	seen := &observed{}
+	clientSession, ctx := newTestSessionWith(t, fakeNomadClient{seen: seen})
+
+	// Periodic and dispatched child jobs are named "<parent>/periodic-<ts>". The
+	// slash must survive as part of the job ID rather than becoming a path segment.
+	resource, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{
+		URI: "nomad://jobs/default/batch%2Fperiodic-123/summary",
+	})
+	must.NoError(t, err)
+	must.Positive(t, len(resource.Contents))
+
+	seen.snapshot(func(o *observed) {
+		must.SliceContains(t, o.jobIDs, "batch/periodic-123")
+	})
+}
+
+func TestExplainJobPromptEscapesSlashInJobID(t *testing.T) {
+	t.Parallel()
+
+	seen := &observed{}
+	clientSession, ctx := newTestSessionWith(t, fakeNomadClient{seen: seen})
+
+	prompt, err := clientSession.GetPrompt(ctx, &mcp.GetPromptParams{
+		Name:      "explain_job",
+		Arguments: map[string]string{"namespace": "default", "job_id": "batch/periodic-123"},
+	})
+	must.NoError(t, err)
+	must.Positive(t, len(prompt.Messages))
+
+	seen.snapshot(func(o *observed) {
+		must.SliceContains(t, o.jobIDs, "batch/periodic-123")
+	})
+}
+
+func TestDebugAllocationPromptHandlesNilLogTail(t *testing.T) {
+	t.Parallel()
+
+	// A Facade may legitimately report "no logs" as a nil tail; the prompt must not
+	// dereference it.
+	clientSession, ctx := newTestSessionWith(t, fakeNomadClient{nilLogTail: true})
+
+	prompt, err := clientSession.GetPrompt(ctx, &mcp.GetPromptParams{
+		Name:      "debug_allocation",
+		Arguments: map[string]string{"alloc_id": "alloc-1", "task_name": "web"},
+	})
+	must.NoError(t, err)
+	must.Positive(t, len(prompt.Messages))
+}
+
+func TestToolResultContentCarriesStructuredPayload(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "list_jobs"})
+	must.NoError(t, err)
+	must.False(t, result.IsError)
+
+	// Clients that read only Content must still receive the data, not just the
+	// summary line. The SDK omits its own JSON fallback when Content is set.
+	must.Len(t, 2, result.Content)
+
+	summary, ok := result.Content[0].(*mcp.TextContent)
+	must.True(t, ok)
+	must.StrContains(t, summary.Text, "Returned 1 jobs.")
+
+	payload, ok := result.Content[1].(*mcp.TextContent)
+	must.True(t, ok)
+
+	var decoded map[string]any
+	must.NoError(t, json.Unmarshal([]byte(payload.Text), &decoded))
+	jobs, ok := decoded["jobs"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, jobs)
+}
+
+func TestToolsAdvertiseReadOnlyAnnotations(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	must.NoError(t, err)
+	must.Positive(t, len(toolsResult.Tools))
+
+	// Read-only is a hard invariant of this server, so every tool must say so.
+	for _, tool := range toolsResult.Tools {
+		must.NotNil(t, tool.Annotations)
+		must.True(t, tool.Annotations.ReadOnlyHint)
+		must.True(t, tool.Annotations.IdempotentHint)
+		must.NotNil(t, tool.Annotations.OpenWorldHint)
+		must.True(t, *tool.Annotations.OpenWorldHint)
+	}
+}
+
+func TestToolsRejectMissingRequiredIDs(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	for _, testCase := range []struct {
+		tool     string
+		argument string
+	}{
+		{tool: "get_job", argument: "job_id"},
+		{tool: "get_job_scale_status", argument: "job_id"},
+		{tool: "get_job_evaluations", argument: "job_id"},
+		{tool: "get_job_allocations", argument: "job_id"},
+		{tool: "get_job_services", argument: "job_id"},
+		{tool: "get_deployment", argument: "deployment_id"},
+		{tool: "get_node", argument: "node_id"},
+		{tool: "get_allocation", argument: "allocation_id"},
+		{tool: "get_allocation_checks", argument: "allocation_id"},
+	} {
+		// An empty ID would otherwise be sent straight to Nomad (e.g. /v1/job/).
+		result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+			Name:      testCase.tool,
+			Arguments: map[string]any{testCase.argument: ""},
+		})
+		must.NoError(t, err)
+		must.True(t, result.IsError, must.Sprintf("%s accepted an empty %s", testCase.tool, testCase.argument))
+
+		message, ok := result.Content[0].(*mcp.TextContent)
+		must.True(t, ok)
+		must.StrContains(t, message.Text, testCase.argument+" is required")
+	}
 }

@@ -53,7 +53,21 @@ func (q objectQueryInput) queryOptions() *api.QueryOptions {
 
 func addTool[In, Out any](server *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
 	tool.InputSchema = mustToolInputSchema[In]()
+	if tool.Annotations == nil {
+		// Every tool here is a read-only Nomad query, so hosts can auto-approve and
+		// repeat calls. OpenWorldHint is true because the tools talk to an external
+		// cluster whose contents this server does not control.
+		tool.Annotations = &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  ptr(true),
+		}
+	}
 	mcp.AddTool(server, tool, handler)
+}
+
+func ptr[T any](value T) *T {
+	return &value
 }
 
 func mustToolInputSchema[T any]() map[string]any {
@@ -167,10 +181,16 @@ func slicesContains[T comparable](items []T, target T) bool {
 	return false
 }
 
-func okResult(summary string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+// structuredResult returns the human-readable summary plus the serialized output
+// as a second text block. The SDK only synthesizes that JSON fallback when
+// Content is nil, so without it clients that ignore structuredContent would see
+// the summary line and none of the data.
+func structuredResult(summary string, output any) *mcp.CallToolResult {
+	content := []mcp.Content{&mcp.TextContent{Text: summary}}
+	if encoded, err := json.Marshal(output); err == nil {
+		content = append(content, &mcp.TextContent{Text: string(encoded)})
 	}
+	return &mcp.CallToolResult{Content: content}
 }
 
 func failResult(err error) *mcp.CallToolResult {
@@ -235,13 +255,6 @@ func metadataSummary(items map[string]string) string {
 	}
 
 	return strings.Join(parts, ", ")
-}
-
-func formatSubmitTime(nanos int64) string {
-	if nanos <= 0 {
-		return ""
-	}
-	return time.Unix(0, nanos).UTC().Format(time.RFC3339)
 }
 
 func formatUnixNanos(nanos int64) string {

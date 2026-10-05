@@ -18,9 +18,11 @@ type AllocationLogTail struct {
 	RequestedLines int
 	AppliedLines   int
 	ReturnedBytes  int
-	Truncated      bool
-	LogType        string
-	TaskName       string
+	// Truncated reports that Text is not the complete requested tail: either the
+	// request exceeded maxLogTailLines, or the byte budget clipped the start of it.
+	Truncated bool
+	LogType   string
+	TaskName  string
 }
 
 type Facade interface {
@@ -207,21 +209,38 @@ func (c *Client) GetAllocationLogs(allocationID string, taskName string, logType
 	cancel := make(chan struct{})
 	defer close(cancel)
 
+	// The byte budget is the hard cap on how much is read; appliedLines is enforced
+	// afterwards by trimLogTail, since the API offsets by bytes, not by lines.
+	byteBudget := int64(appliedLines) * int64(logTailBytesPerLine)
+
 	frames, errCh := c.raw.AllocFS().Logs(
 		alloc,
 		false,
 		taskName,
 		logType,
 		api.OriginEnd,
-		int64(appliedLines)*int64(logTailBytesPerLine),
+		byteBudget,
 		cancel,
 		withContext(query),
 	)
+
+	newTail := func(text string, clipped bool) *AllocationLogTail {
+		return &AllocationLogTail{
+			Text:           text,
+			RequestedLines: lines,
+			AppliedLines:   appliedLines,
+			ReturnedBytes:  len(text),
+			Truncated:      truncated || clipped,
+			LogType:        logType,
+			TaskName:       taskName,
+		}
+	}
+
 	if frames == nil {
 		if err := <-errCh; err != nil {
 			return nil, err
 		}
-		return nil, nil
+		return newTail("", false), nil
 	}
 
 	var builder strings.Builder
@@ -240,16 +259,44 @@ func (c *Client) GetAllocationLogs(allocationID string, taskName string, logType
 	default:
 	}
 
-	text := builder.String()
-	return &AllocationLogTail{
-		Text:           text,
-		RequestedLines: lines,
-		AppliedLines:   appliedLines,
-		ReturnedBytes:  len(text),
-		Truncated:      truncated,
-		LogType:        logType,
-		TaskName:       taskName,
-	}, nil
+	raw := builder.String()
+	clipped := int64(len(raw)) >= byteBudget
+	return newTail(trimLogTail(raw, appliedLines, clipped), clipped), nil
+}
+
+// trimLogTail bounds a tail that was read backwards from the end of a log file.
+// A byte-offset read almost always lands mid-line, so when the budget was
+// exhausted the leading partial line is dropped; the result is then trimmed to
+// the last lines entries.
+func trimLogTail(text string, lines int, clipped bool) string {
+	if clipped {
+		// With no newline at all the whole read is one oversized partial line;
+		// keep it rather than returning nothing.
+		if index := strings.IndexByte(text, '\n'); index >= 0 {
+			text = text[index+1:]
+		}
+	}
+	return lastLines(text, lines)
+}
+
+// lastLines returns the trailing n lines of text, preserving whether the input
+// ended with a newline. A single trailing newline does not count as a line.
+func lastLines(text string, n int) string {
+	if text == "" || n <= 0 {
+		return text
+	}
+
+	body := strings.TrimSuffix(text, "\n")
+	parts := strings.Split(body, "\n")
+	if len(parts) <= n {
+		return text
+	}
+
+	trimmed := strings.Join(parts[len(parts)-n:], "\n")
+	if strings.HasSuffix(text, "\n") {
+		trimmed += "\n"
+	}
+	return trimmed
 }
 
 func withContext(query *api.QueryOptions) *api.QueryOptions {

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/hashicorp/nomad/api"
@@ -40,7 +41,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 			"regions": regions,
 		}
 
-		return okResult(fmt.Sprintf("Leader %s with %d peers across %d known regions.", leader, len(peers), len(regions))), output, nil
+		return structuredResult(fmt.Sprintf("Leader %s with %d peers across %d known regions.", leader, len(peers), len(regions)), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -53,7 +54,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 		}
 
 		output := map[string]any{"regions": regions}
-		return okResult(fmt.Sprintf("Returned %d regions.", len(regions))), output, nil
+		return structuredResult(fmt.Sprintf("Returned %d regions.", len(regions)), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -81,7 +82,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 			"namespaces": items,
 			"meta":       metaMap(queryMeta),
 		}
-		return okResult(summarizeList("namespaces", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("namespaces", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -119,7 +120,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 			"nodes": items,
 			"meta":  metaMap(queryMeta),
 		}
-		return okResult(summarizeList("nodes", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("nodes", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -129,6 +130,10 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 		NodeID string `json:"node_id" jsonschema:"full Nomad node ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.NodeID == "" {
+			return failResult(errors.New("node_id is required")), nil, nil
+		}
+
 		node, queryMeta, err := nomadClient.GetNode(input.NodeID, input.objectQueryInput.queryOptions().WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
@@ -170,7 +175,7 @@ func registerClusterTools(server *mcp.Server, nomadClient client.Facade) {
 			"meta": metaMap(queryMeta),
 		}
 
-		return okResult(fmt.Sprintf("Node %s is %s with %d allocations.", node.ID, node.Status, len(allocationIDs))), output, nil
+		return structuredResult(fmt.Sprintf("Node %s is %s with %d allocations.", node.ID, node.Status, len(allocationIDs)), output), output, nil
 	})
 }
 

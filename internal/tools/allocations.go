@@ -2,8 +2,8 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	client "github.com/serviceware/nomad-mcp/internal/nomad"
@@ -40,7 +40,7 @@ func registerAllocationTools(server *mcp.Server, nomadClient client.Facade) {
 			"allocations": items,
 			"meta":        metaMap(queryMeta),
 		}
-		return okResult(summarizeList("allocations", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("allocations", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -50,19 +50,17 @@ func registerAllocationTools(server *mcp.Server, nomadClient client.Facade) {
 		AllocationID string `json:"allocation_id" jsonschema:"full Nomad allocation ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
-		query := input.objectQueryInput.queryOptions().WithContext(ctx)
-		allocation, queryMeta, err := nomadClient.GetAllocation(input.AllocationID, query)
+		if input.AllocationID == "" {
+			return failResult(errors.New("allocation_id is required")), nil, nil
+		}
+
+		base := input.objectQueryInput.queryOptions()
+		allocation, queryMeta, err := nomadClient.GetAllocation(input.AllocationID, base.WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
 		}
 
-		// The alloc lookup is namespace-agnostic (IDs are cluster-global), but the
-		// services lookup enforces namespace. Use the allocation's real namespace so
-		// a caller-supplied or wildcard namespace can't turn a found alloc into a
-		// spurious 404.
-		servicesQuery := input.objectQueryInput.queryOptions().WithContext(ctx)
-		servicesQuery.Namespace = allocation.Namespace
-		services, servicesMeta, err := nomadClient.ListAllocationServices(input.AllocationID, servicesQuery)
+		services, servicesMeta, err := nomadClient.ListAllocationServices(input.AllocationID, queryForAllocation(ctx, base, allocation))
 		if err != nil {
 			return failResult(err), nil, nil
 		}
@@ -101,7 +99,7 @@ func registerAllocationTools(server *mcp.Server, nomadClient client.Facade) {
 			"meta": metaMap(queryMeta),
 		}
 
-		return okResult(fmt.Sprintf("Allocation %s is %s on node %s.", allocation.ID, allocation.ClientStatus, allocation.NodeID)), output, nil
+		return structuredResult(fmt.Sprintf("Allocation %s is %s on node %s.", allocation.ID, allocation.ClientStatus, allocation.NodeID), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -111,47 +109,17 @@ func registerAllocationTools(server *mcp.Server, nomadClient client.Facade) {
 		AllocationID string `json:"allocation_id" jsonschema:"full Nomad allocation ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
-		checks, err := nomadClient.GetAllocationChecks(input.AllocationID, input.objectQueryInput.queryOptions().WithContext(ctx))
+		if input.AllocationID == "" {
+			return failResult(errors.New("allocation_id is required")), nil, nil
+		}
+
+		output, passing, err := allocationChecksPayload(ctx, nomadClient, input.AllocationID, input.objectQueryInput.queryOptions())
 		if err != nil {
 			return failResult(err), nil, nil
 		}
 
-		checkIDs := make([]string, 0, len(checks))
-		for id := range checks {
-			checkIDs = append(checkIDs, id)
-		}
-		sort.Strings(checkIDs)
-
-		items := make([]map[string]any, 0, len(checkIDs))
-		passing := 0
-		for _, id := range checkIDs {
-			check := checks[id]
-			if check.Status == "success" {
-				passing++
-			}
-
-			items = append(items, map[string]any{
-				"id":          check.ID,
-				"check":       check.Check,
-				"group":       check.Group,
-				"task":        check.Task,
-				"service":     check.Service,
-				"mode":        check.Mode,
-				"status":      check.Status,
-				"status_code": check.StatusCode,
-				"output":      check.Output,
-				"timestamp":   check.Timestamp,
-				"observed_at": formatUnixSeconds(check.Timestamp),
-			})
-		}
-
-		output := map[string]any{
-			"allocation_id": input.AllocationID,
-			"passing":       passing,
-			"failing":       len(items) - passing,
-			"checks":        items,
-		}
-
-		return okResult(fmt.Sprintf("Allocation %s has %d checks, %d passing.", input.AllocationID, len(items), passing)), output, nil
+		checks, _ := output["checks"].([]map[string]any)
+		summary := fmt.Sprintf("Allocation %s has %d checks, %d passing.", input.AllocationID, len(checks), passing)
+		return structuredResult(summary, output), output, nil
 	})
 }

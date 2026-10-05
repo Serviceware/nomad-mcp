@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	client "github.com/serviceware/nomad-mcp/internal/nomad"
@@ -29,11 +30,12 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		stream := normalizeLogStream(req.Params.Arguments["stream"])
 		tailLines := parsePromptTailLines(req.Params.Arguments["tail_lines"])
 
-		if taskName == "" {
-			allocation, _, err := nomadClient.GetAllocation(allocID, queryWithContext(ctx))
-			if err == nil {
-				taskName = defaultTaskName(allocation)
-			}
+		// The allocation is looked up for its namespace, which the logs endpoint
+		// enforces, and to pick a default task. A failure here is not fatal: the
+		// embedded status resource below reports the real error.
+		allocation, _, err := nomadClient.GetAllocation(allocID, queryWithContext(ctx))
+		if err == nil && taskName == "" {
+			taskName = defaultTaskName(allocation)
 		}
 
 		messages := []*mcp.PromptMessage{{
@@ -45,8 +47,8 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}}
 
 		for _, uri := range []string{
-			fmt.Sprintf("nomad://allocs/%s/status", allocID),
-			fmt.Sprintf("nomad://allocs/%s/checks", allocID),
+			fmt.Sprintf("nomad://allocs/%s/status", url.PathEscape(allocID)),
+			fmt.Sprintf("nomad://allocs/%s/checks", url.PathEscape(allocID)),
 		} {
 			resource, err := embeddedResourceForURI(ctx, nomadClient, uri)
 			if err != nil {
@@ -56,22 +58,24 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}
 
 		if taskName != "" {
-			logURI := fmt.Sprintf("nomad://allocs/%s/logs/%s/%s", allocID, taskName, stream)
-			logTail, err := nomadClient.GetAllocationLogs(allocID, taskName, stream, tailLines, queryWithContext(ctx))
+			logURI := fmt.Sprintf("nomad://allocs/%s/logs/%s/%s", url.PathEscape(allocID), url.PathEscape(taskName), stream)
+			logTail, err := nomadClient.GetAllocationLogs(allocID, taskName, stream, tailLines, queryForAllocation(ctx, nil, allocation))
 			if err != nil {
 				return nil, err
 			}
-			messages = append(messages, &mcp.PromptMessage{Role: "user", Content: &mcp.EmbeddedResource{Resource: &mcp.ResourceContents{
-				URI:      logURI,
-				MIMEType: "text/plain",
-				Text:     logTail.Text,
-				Meta: mcp.Meta{
+			// A Facade may report "no logs available" as a nil tail; attach an empty
+			// log block rather than dereferencing it.
+			contents := &mcp.ResourceContents{URI: logURI, MIMEType: "text/plain"}
+			if logTail != nil {
+				contents.Text = logTail.Text
+				contents.Meta = mcp.Meta{
 					"requested_lines": logTail.RequestedLines,
 					"applied_lines":   logTail.AppliedLines,
 					"returned_bytes":  logTail.ReturnedBytes,
 					"truncated":       logTail.Truncated,
-				},
-			}}})
+				}
+			}
+			messages = append(messages, &mcp.PromptMessage{Role: "user", Content: &mcp.EmbeddedResource{Resource: contents}})
 		}
 
 		return &mcp.GetPromptResult{Description: "Allocation debugging workflow", Messages: messages}, nil
@@ -88,7 +92,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 			return nil, fmt.Errorf("eval_id is required")
 		}
 
-		resource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://evaluations/%s", evalID))
+		resource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://evaluations/%s", url.PathEscape(evalID)))
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +117,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 			return nil, fmt.Errorf("deployment_id is required")
 		}
 
-		resource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://deployments/%s", deploymentID))
+		resource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://deployments/%s", url.PathEscape(deploymentID)))
 		if err != nil {
 			return nil, err
 		}
@@ -138,11 +142,11 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 			return nil, fmt.Errorf("node_id is required")
 		}
 
-		statusResource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://nodes/%s/status", nodeID))
+		statusResource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://nodes/%s/status", url.PathEscape(nodeID)))
 		if err != nil {
 			return nil, err
 		}
-		allocationsResource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://nodes/%s/allocations", nodeID))
+		allocationsResource, err := embeddedResourceForURI(ctx, nomadClient, fmt.Sprintf("nomad://nodes/%s/allocations", url.PathEscape(nodeID)))
 		if err != nil {
 			return nil, err
 		}
@@ -182,9 +186,9 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}}
 
 		for _, uri := range []string{
-			fmt.Sprintf("nomad://jobs/%s/%s/summary", namespace, jobID),
-			fmt.Sprintf("nomad://jobs/%s/%s/spec", namespace, jobID),
-			fmt.Sprintf("nomad://jobs/%s/%s/evaluations", namespace, jobID),
+			fmt.Sprintf("nomad://jobs/%s/%s/summary", url.PathEscape(namespace), url.PathEscape(jobID)),
+			fmt.Sprintf("nomad://jobs/%s/%s/spec", url.PathEscape(namespace), url.PathEscape(jobID)),
+			fmt.Sprintf("nomad://jobs/%s/%s/evaluations", url.PathEscape(namespace), url.PathEscape(jobID)),
 		} {
 			resource, err := embeddedResourceForURI(ctx, nomadClient, uri)
 			if err != nil {

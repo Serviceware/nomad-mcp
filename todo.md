@@ -25,16 +25,16 @@ Review snapshot of the read-only Nomad MCP server. Build, `go vet`, `gofmt -l`, 
 
 ## Test coverage gaps
 
-- [ ] Only `internal/server` has tests. `internal/nomad`, `internal/tools`, `internal/logging`,
-  and `cmd/` have none.
-- [ ] **`GetAllocationLogs` is never tested** — the one method with real logic (line-bound clamping,
-  `Truncated` flag, stdout/stderr defaulting, byte budget). The fake bypasses it entirely.
+- [ ] `internal/tools`, `internal/logging`, and `cmd/` have no tests. (`internal/nomad` now has
+  `logtail_test.go`.)
+- [ ] **`GetAllocationLogs` is never tested end to end** — stdout/stderr defaulting, the byte
+  budget, and the `Truncated` flag still go untested; the fake bypasses the method entirely.
+  Line trimming is covered by `trimLogTail` / `lastLines` unit tests.
 - [ ] **Error paths untested** — no test drives a `Facade` method returning an error to verify
   `failResult` / `userFacingError` (ACL-denial sanitization, `IsError` flag).
-- [ ] **Resource URI routing barely covered** — only `nomad://jobs/default/example/summary` is read.
-  The dispatch in `readNomadResource` (10 templates, segment-count branches, 4-segment log path)
-  and `ResourceNotFoundError` for malformed URIs are untested. A node-status resource test would
-  have caught the nil-deref above.
+- [ ] **Resource URI routing still thinly covered** — the alloc status/checks/logs paths and a
+  percent-encoded job ID are now read, but `ResourceNotFoundError` for malformed URIs and several
+  of the 10 templates remain untested.
 - [ ] **Helpers untested** — `parsePromptTailLines`, `normalizeLogStream`, `metadataSummary`,
   `defaultTaskName`, the `deref*` helpers.
 - [ ] Tests assert `must.Positive(t, len(...))` ("something came back") rather than exact tool/
@@ -65,8 +65,8 @@ Review snapshot of the read-only Nomad MCP server. Build, `go vet`, `gofmt -l`, 
 
 ## Code cleanup (low priority)
 
-- [ ] **Duplicate identical helpers** — `formatSubmitTime` and `formatUnixNanos` are byte-for-byte
-  identical (`internal/tools/helpers.go:240-252`). Consolidate.
+- [x] **Duplicate identical helpers** — `formatSubmitTime` and `formatUnixNanos` were byte-for-byte
+  identical. Consolidated onto `formatUnixNanos`.
 - [ ] **`userFacingError` "not found" branch is a no-op** — returns `message` unchanged, identical
   to `default` (`internal/tools/helpers.go:192-195`).
 - [ ] **Leftover compile-anchor** — `var _ = api.AllNamespacesNamespace` (`internal/tools/cluster.go:177`)
@@ -78,7 +78,33 @@ Review snapshot of the read-only Nomad MCP server. Build, `go vet`, `gofmt -l`, 
 
 - [ ] **`nomad/api` pinned to a pseudo-version** (`v0.0.0-20260317185003-...`), not a tagged release —
   a moving target with no semver guarantees. Pin to a tagged Nomad API release if available.
-- [ ] **`go 1.26.1` full-patch pin** in `go.mod` may cause friction for contributors on slightly
-  older patch toolchains; consider `go 1.26`.
+- [ ] **`go 1.27.1` full-patch pin** in `go.mod` may cause friction for contributors on slightly
+  older patch toolchains; consider `go 1.27`. Note the official `golang` images set
+  `GOTOOLCHAIN=local`, so the Dockerfile base image has to match the pin exactly.
 - [ ] Dockerfile is solid (distroless static, multistage, `-trimpath -ldflags='-s -w'`); optionally
   add image labels / a version build-arg.
+
+## Follow-ups from the 2026-10-05 review pass
+
+- [ ] **`Out` is `map[string]any` for every tool**, so each advertised `outputSchema` is a generic
+  object. Typed output structs per tool would give clients a real schema to validate and plan
+  against. This is a large, mechanical change across `cluster.go` / `jobs.go` / `allocations.go`
+  and was deliberately deferred.
+
+### Resolved in that pass
+
+- [x] Dockerfile base image was `golang:1.26.1` against a `go 1.27.1` `go.mod` — with
+  `GOTOOLCHAIN=local` in the official images the build could not succeed.
+- [x] `allocationStatusResource`, `allocationChecksResource`, the allocation logs resource, the
+  `get_allocation_checks` tool, and the `debug_allocation` prompt all queried namespace-scoped
+  endpoints under the default namespace. All now re-scope via `queryForAllocation`.
+- [x] Job IDs containing `/` (periodic and dispatched children) could not be addressed: prompts
+  built URIs without escaping, and `resourcePathSegments` split the already-decoded path.
+- [x] `debug_allocation` dereferenced a possibly-nil `AllocationLogTail`.
+- [x] Tool `Content` held only the summary line, so clients ignoring `structuredContent` got no
+  data. Now `structuredResult` appends the serialized payload.
+- [x] No tool advertised `ToolAnnotations`; `addTool` now stamps read-only/idempotent/open-world.
+- [x] The log tail was byte-bounded but not line-bounded; `trimLogTail` drops the leading partial
+  line and trims to the applied line count.
+- [x] Empty `job_id` / `node_id` / `deployment_id` / `allocation_id` were forwarded to Nomad.
+- [x] The check-listing and job-summary payloads were duplicated between a tool and a resource.
