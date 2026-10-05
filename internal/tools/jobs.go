@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -33,7 +34,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 				"priority":      job.Priority,
 				"status":        job.Status,
 				"datacenters":   job.Datacenters,
-				"submit_time":   formatSubmitTime(job.SubmitTime),
+				"submit_time":   formatUnixNanos(job.SubmitTime),
 				"stop":          job.Stop,
 				"periodic":      job.Periodic,
 				"parameterized": job.ParameterizedJob,
@@ -46,7 +47,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"jobs": items,
 			"meta": metaMap(queryMeta),
 		}
-		return okResult(summarizeList("jobs", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("jobs", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -56,66 +57,17 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		JobID string `json:"job_id" jsonschema:"full Nomad job ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
-		query := input.objectQueryInput.queryOptions().WithContext(ctx)
-		job, queryMeta, err := nomadClient.GetJob(input.JobID, query)
+		if input.JobID == "" {
+			return failResult(errors.New("job_id is required")), nil, nil
+		}
+
+		output, job, err := jobSummaryPayload(ctx, nomadClient, input.JobID, input.objectQueryInput.queryOptions())
 		if err != nil {
 			return failResult(err), nil, nil
 		}
 
-		summary, summaryMeta, err := nomadClient.GetJobSummary(input.JobID, query)
-		if err != nil {
-			return failResult(err), nil, nil
-		}
-
-		deployments, deploymentsMeta, err := nomadClient.ListJobDeployments(input.JobID, false, query)
-		if err != nil {
-			return failResult(err), nil, nil
-		}
-
-		latestDeployments := make([]map[string]any, 0, len(deployments))
-		for _, deployment := range deployments {
-			if deployment == nil {
-				continue
-			}
-			latestDeployments = append(latestDeployments, map[string]any{
-				"id":                 deployment.ID,
-				"status":             deployment.Status,
-				"status_description": deployment.StatusDescription,
-				"job_version":        deployment.JobVersion,
-			})
-		}
-
-		output := map[string]any{
-			"job": map[string]any{
-				"id":               derefString(job.ID),
-				"name":             derefString(job.Name),
-				"namespace":        derefString(job.Namespace),
-				"type":             derefString(job.Type),
-				"priority":         derefInt(job.Priority),
-				"version":          derefUint64(job.Version),
-				"stable":           derefBool(job.Stable),
-				"stop":             derefBool(job.Stop),
-				"submit_time":      formatSubmitTime(derefInt64(job.SubmitTime)),
-				"datacenters":      job.Datacenters,
-				"meta":             job.Meta,
-				"task_group_count": len(job.TaskGroups),
-				"task_groups":      taskGroupsMap(job.TaskGroups),
-			},
-			"summary": map[string]any{
-				"job_id":    summary.JobID,
-				"namespace": summary.Namespace,
-				"groups":    summary.Summary,
-				"children":  summary.Children,
-				"meta":      metaMap(summaryMeta),
-			},
-			"deployments": map[string]any{
-				"items": latestDeployments,
-				"meta":  metaMap(deploymentsMeta),
-			},
-			"meta": metaMap(queryMeta),
-		}
-
-		return okResult(fmt.Sprintf("Job %s is %s with %d task groups.", derefString(job.ID), derefString(job.Status), len(job.TaskGroups))), output, nil
+		summary := fmt.Sprintf("Job %s is %s with %d task groups.", derefString(job.ID), derefString(job.Status), len(job.TaskGroups))
+		return structuredResult(summary, output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -125,6 +77,10 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		JobID string `json:"job_id" jsonschema:"full Nomad job ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.JobID == "" {
+			return failResult(errors.New("job_id is required")), nil, nil
+		}
+
 		scaleStatus, queryMeta, err := nomadClient.GetJobScaleStatus(input.JobID, input.objectQueryInput.queryOptions().WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
@@ -173,7 +129,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"meta":        metaMap(queryMeta),
 		}
 
-		return okResult(fmt.Sprintf("Job %s has scaling status for %d task groups.", scaleStatus.JobID, len(groups))), output, nil
+		return structuredResult(fmt.Sprintf("Job %s has scaling status for %d task groups.", scaleStatus.JobID, len(groups)), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -183,6 +139,10 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		JobID string `json:"job_id" jsonschema:"full Nomad job ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.JobID == "" {
+			return failResult(errors.New("job_id is required")), nil, nil
+		}
+
 		evaluations, queryMeta, err := nomadClient.ListJobEvaluations(input.JobID, input.objectQueryInput.queryOptions().WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
@@ -225,7 +185,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"evaluations": items,
 			"meta":        metaMap(queryMeta),
 		}
-		return okResult(summarizeList("evaluations", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("evaluations", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -236,6 +196,10 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		All   bool   `json:"all,omitempty" jsonschema:"include terminal allocations"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.JobID == "" {
+			return failResult(errors.New("job_id is required")), nil, nil
+		}
+
 		allocations, queryMeta, err := nomadClient.ListJobAllocations(input.JobID, input.All, input.objectQueryInput.queryOptions().WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
@@ -263,7 +227,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"allocations": items,
 			"meta":        metaMap(queryMeta),
 		}
-		return okResult(summarizeList("allocations", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("allocations", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -273,6 +237,10 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		JobID string `json:"job_id" jsonschema:"full Nomad job ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.JobID == "" {
+			return failResult(errors.New("job_id is required")), nil, nil
+		}
+
 		services, queryMeta, err := nomadClient.ListJobServices(input.JobID, input.objectQueryInput.queryOptions().WithContext(ctx))
 		if err != nil {
 			return failResult(err), nil, nil
@@ -291,7 +259,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"services": items,
 			"meta":     metaMap(queryMeta),
 		}
-		return okResult(summarizeList("services", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("services", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -323,7 +291,7 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"deployments": items,
 			"meta":        metaMap(queryMeta),
 		}
-		return okResult(summarizeList("deployments", len(items), queryMeta)), output, nil
+		return structuredResult(summarizeList("deployments", len(items), queryMeta), output), output, nil
 	})
 
 	addTool(server, &mcp.Tool{
@@ -333,6 +301,10 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 		DeploymentID string `json:"deployment_id" jsonschema:"full Nomad deployment ID"`
 		objectQueryInput
 	}) (*mcp.CallToolResult, map[string]any, error) {
+		if input.DeploymentID == "" {
+			return failResult(errors.New("deployment_id is required")), nil, nil
+		}
+
 		query := input.objectQueryInput.queryOptions().WithContext(ctx)
 		deployment, queryMeta, err := nomadClient.GetDeployment(input.DeploymentID, query)
 		if err != nil {
@@ -377,6 +349,6 @@ func registerJobTools(server *mcp.Server, nomadClient client.Facade) {
 			"meta": metaMap(queryMeta),
 		}
 
-		return okResult(fmt.Sprintf("Deployment %s is %s with %d allocations.", deployment.ID, deployment.Status, len(allocationItems))), output, nil
+		return structuredResult(fmt.Sprintf("Deployment %s is %s with %d allocations.", deployment.ID, deployment.Status, len(allocationItems)), output), output, nil
 	})
 }

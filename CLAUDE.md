@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `nomad-mcp` is a **read-only** MCP (Model Context Protocol) server for HashiCorp Nomad, built with the official Go MCP SDK (`github.com/modelcontextprotocol/go-sdk`) and the official Nomad API client (`github.com/hashicorp/nomad/api`). It exposes Nomad inspection workflows over `stdio` transport as MCP tools, resources, and prompts. It performs no writes, exposes no event streams / blocking queries, and serves only bounded static log tails (no follow mode or filesystem browsing).
 
-Requires Go 1.26.1.
+Requires Go 1.27.1.
 
 ## Commands
 
@@ -18,7 +18,7 @@ go test ./internal/server -run TestName   # run a single test
 gofmt -w .                 # format
 ```
 
-The only test package is `internal/server`. The VS Code MCP config (`.vscode/mcp.json`) runs the server via `go run ./cmd/nomad-mcp` as the `nomad-mcp-test` server.
+Tests live in `internal/server` (full server driven against a fake `Facade`) and `internal/nomad` (log-tail trimming). The VS Code MCP config (`.vscode/mcp.json`) runs the server via `go run ./cmd/nomad-mcp` as the `nomad-mcp-test` server.
 
 Docker: `docker build -t nomad-mcp .` (multi-stage, distroless static image; entrypoint is the binary over stdio).
 
@@ -41,10 +41,14 @@ Flow: `cmd/nomad-mcp/main.go` builds the logger and a Nomad client, then calls `
 
 ## Conventions and patterns
 
-- **Tool registration** goes through the generic `addTool[In, Out]` helper in `helpers.go`, not `mcp.AddTool` directly. It builds the input JSON schema from the `In` type via reflection (`jsonschema.ForType`) and `ensureObjectProperties` (a workaround that fills in empty `properties` so generated schemas validate). Input structs use `json` + `jsonschema` struct tags; embed `listQueryInput` / `objectQueryInput` to get the standard namespace/region/pagination/stale-read inputs and their `queryOptions()` conversion.
+- **Tool registration** goes through the generic `addTool[In, Out]` helper in `helpers.go`, not `mcp.AddTool` directly. It builds the input JSON schema from the `In` type via reflection (`jsonschema.ForType`) and `ensureObjectProperties` (a workaround that fills in empty `properties` so generated schemas validate). Input structs use `json` + `jsonschema` struct tags; embed `listQueryInput` / `objectQueryInput` to get the standard namespace/region/pagination/stale-read inputs and their `queryOptions()` conversion. `addTool` also stamps every tool with read-only `mcp.ToolAnnotations`.
 - **Errors are returned to the model, not as Go errors.** Tool handlers return `failResult(err)` (a `*mcp.CallToolResult` with `IsError: true`) and a `nil` error, so middleware sees success. `userFacingError` sanitizes messages (e.g. ACL permission denials). Only return a real Go error for programmer/argument errors.
 - Always thread the request context: call `input.queryOptions().WithContext(ctx)`.
+- Tools return `structuredResult(summary, output)`, which puts the human-readable summary *and* the serialized output in `Content`. The SDK only synthesizes a JSON fallback when `Content` is nil, so a bare summary would leave `structuredContent`-ignoring clients with no data.
 - Output is a structured `map[string]any` plus a human-readable summary string built with helpers like `summarizeList`, `metaMap`, `metadataSummary`, and the `deref*` pointer helpers.
+- **Allocation sub-queries must be re-scoped.** Looking an allocation up by ID is namespace-agnostic, but its services, checks, and logs endpoints enforce the namespace. Fetch the allocation first, then pass `queryForAllocation(ctx, base, alloc)`.
+- **Payloads shared between a tool and a resource live in `resources.go`** (`jobSummaryPayload`, `allocationChecksPayload`) so a fix lands in one place.
+- **IDs can contain `/`** (periodic/dispatched children are `parent/periodic-<ts>`). Interpolate them into `nomad://` URIs with `url.PathEscape`; `resourcePathSegments` splits the *escaped* path to match.
 - **Read-only is a hard invariant.** Do not add tools/resources that mutate Nomad, stream events, use blocking queries, or follow logs — these are intentionally out of scope.
 - For discovery questions, `list_jobs` is the preferred entry point; it accepts native Nomad `filter` expressions (e.g. `Meta.department == "financial"`) and returns each job's `meta` map plus a stable `meta_summary` string.
 

@@ -203,18 +203,29 @@ func clusterSummaryResource(ctx context.Context, nomadClient client.Facade, uri 
 }
 
 func jobSummaryResource(ctx context.Context, nomadClient client.Facade, uri string, namespace string, jobID string) (*mcp.ReadResourceResult, error) {
-	query := queryWithNamespace(ctx, namespace)
-	job, queryMeta, err := nomadClient.GetJob(jobID, query)
+	payload, _, err := jobSummaryPayload(ctx, nomadClient, jobID, &api.QueryOptions{Namespace: namespace})
 	if err != nil {
 		return nil, err
+	}
+	return jsonResource(uri, payload)
+}
+
+// jobSummaryPayload builds the job + scheduler summary + deployments payload
+// shared by the get_job tool and the job-summary resource. It also returns the
+// job itself so callers can build their own summary line.
+func jobSummaryPayload(ctx context.Context, nomadClient client.Facade, jobID string, base *api.QueryOptions) (map[string]any, *api.Job, error) {
+	query := base.WithContext(ctx)
+	job, queryMeta, err := nomadClient.GetJob(jobID, query)
+	if err != nil {
+		return nil, nil, err
 	}
 	summary, summaryMeta, err := nomadClient.GetJobSummary(jobID, query)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	deployments, deploymentsMeta, err := nomadClient.ListJobDeployments(jobID, false, query)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	items := make([]map[string]any, 0, len(deployments))
@@ -225,20 +236,22 @@ func jobSummaryResource(ctx context.Context, nomadClient client.Facade, uri stri
 		items = append(items, deploymentMap(deployment))
 	}
 
-	return jsonResource(uri, map[string]any{
+	return map[string]any{
 		"job": map[string]any{
 			"id":               derefString(job.ID),
 			"name":             derefString(job.Name),
 			"namespace":        derefString(job.Namespace),
 			"type":             derefString(job.Type),
+			"status":           derefString(job.Status),
 			"priority":         derefInt(job.Priority),
 			"version":          derefUint64(job.Version),
 			"stable":           derefBool(job.Stable),
 			"stop":             derefBool(job.Stop),
-			"submit_time":      formatSubmitTime(derefInt64(job.SubmitTime)),
+			"submit_time":      formatUnixNanos(derefInt64(job.SubmitTime)),
 			"datacenters":      job.Datacenters,
 			"meta":             job.Meta,
 			"task_group_count": len(job.TaskGroups),
+			"task_groups":      taskGroupsMap(job.TaskGroups),
 		},
 		"summary": map[string]any{
 			"job_id":    summary.JobID,
@@ -252,7 +265,7 @@ func jobSummaryResource(ctx context.Context, nomadClient client.Facade, uri stri
 			"meta":  metaMap(deploymentsMeta),
 		},
 		"meta": metaMap(queryMeta),
-	})
+	}, job, nil
 }
 
 func jobSpecResource(ctx context.Context, nomadClient client.Facade, uri string, namespace string, jobID string) (*mcp.ReadResourceResult, error) {
@@ -289,12 +302,11 @@ func jobEvaluationsResource(ctx context.Context, nomadClient client.Facade, uri 
 }
 
 func allocationStatusResource(ctx context.Context, nomadClient client.Facade, uri string, allocationID string) (*mcp.ReadResourceResult, error) {
-	query := queryWithContext(ctx)
-	allocation, queryMeta, err := nomadClient.GetAllocation(allocationID, query)
+	allocation, queryMeta, err := nomadClient.GetAllocation(allocationID, queryWithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
-	services, servicesMeta, err := nomadClient.ListAllocationServices(allocationID, query)
+	services, servicesMeta, err := nomadClient.ListAllocationServices(allocationID, queryForAllocation(ctx, nil, allocation))
 	if err != nil {
 		return nil, err
 	}
@@ -342,9 +354,25 @@ func allocationStatusResource(ctx context.Context, nomadClient client.Facade, ur
 }
 
 func allocationChecksResource(ctx context.Context, nomadClient client.Facade, uri string, allocationID string) (*mcp.ReadResourceResult, error) {
-	checks, err := nomadClient.GetAllocationChecks(allocationID, queryWithContext(ctx))
+	payload, _, err := allocationChecksPayload(ctx, nomadClient, allocationID, nil)
 	if err != nil {
 		return nil, err
+	}
+	return jsonResource(uri, payload)
+}
+
+// allocationChecksPayload builds the health-check payload shared by the
+// get_allocation_checks tool and the allocation-checks resource. It also returns
+// the passing count so callers can build their own summary line.
+func allocationChecksPayload(ctx context.Context, nomadClient client.Facade, allocationID string, base *api.QueryOptions) (map[string]any, int, error) {
+	allocation, _, err := nomadClient.GetAllocation(allocationID, base.WithContext(ctx))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	checks, err := nomadClient.GetAllocationChecks(allocationID, queryForAllocation(ctx, base, allocation))
+	if err != nil {
+		return nil, 0, err
 	}
 
 	checkIDs := make([]string, 0, len(checks))
@@ -375,16 +403,22 @@ func allocationChecksResource(ctx context.Context, nomadClient client.Facade, ur
 		})
 	}
 
-	return jsonResource(uri, map[string]any{
+	return map[string]any{
 		"allocation_id": allocationID,
+		"namespace":     allocation.Namespace,
 		"passing":       passing,
 		"failing":       len(items) - passing,
 		"checks":        items,
-	})
+	}, passing, nil
 }
 
 func allocationLogsResource(ctx context.Context, nomadClient client.Facade, uri string, allocationID string, taskName string, stream string) (*mcp.ReadResourceResult, error) {
-	logTail, err := nomadClient.GetAllocationLogs(allocationID, taskName, normalizeLogStream(stream), defaultPromptTailLines, queryWithContext(ctx))
+	allocation, _, err := nomadClient.GetAllocation(allocationID, queryWithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+
+	logTail, err := nomadClient.GetAllocationLogs(allocationID, taskName, normalizeLogStream(stream), defaultPromptTailLines, queryForAllocation(ctx, nil, allocation))
 	if err != nil {
 		return nil, err
 	}
@@ -568,8 +602,25 @@ func queryWithContext(ctx context.Context) *api.QueryOptions {
 	return (&api.QueryOptions{}).WithContext(ctx)
 }
 
+// queryForAllocation clones base and pins it to the allocation's own namespace.
+// Looking an allocation up by ID is namespace-agnostic because allocation IDs are
+// cluster-global, but the services, checks, and logs endpoints all enforce the
+// namespace — querying them under the default or a wildcard namespace turns a
+// found allocation into a spurious 404. base may be nil.
+func queryForAllocation(ctx context.Context, base *api.QueryOptions, allocation *api.Allocation) *api.QueryOptions {
+	query := base.WithContext(ctx)
+	if allocation != nil {
+		query.Namespace = allocation.Namespace
+	}
+	return query
+}
+
+// resourcePathSegments splits the URI path into decoded segments. It splits the
+// *escaped* path so that an ID containing a slash (periodic and dispatched child
+// jobs look like "myjob/periodic-1700000000") stays a single segment: url.Parse
+// has already turned %2F back into / in parsed.Path.
 func resourcePathSegments(parsed *url.URL) ([]string, error) {
-	trimmed := strings.Trim(parsed.Path, "/")
+	trimmed := strings.Trim(parsed.EscapedPath(), "/")
 	if trimmed == "" {
 		return nil, nil
 	}
