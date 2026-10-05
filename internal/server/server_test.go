@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	client "github.com/serviceware/nomad-mcp/internal/nomad"
 	"github.com/shoenig/test/must"
@@ -40,7 +42,10 @@ type fakeNomadClient struct {
 	// nilLogTail makes GetAllocationLogs return (nil, nil), which a Facade is
 	// allowed to do when no logs are available.
 	nilLogTail bool
-	seen       *observed
+	// aclDenied makes GetAllocation fail the way Nomad does for a token without
+	// read-job, including the server address in the raw message.
+	aclDenied bool
+	seen      *observed
 }
 
 func (f fakeNomadClient) namespace() string {
@@ -158,6 +163,9 @@ func (fakeNomadClient) ListAllocations(query *api.QueryOptions) ([]*api.Allocati
 	return []*api.AllocationListStub{}, &api.QueryMeta{}, nil
 }
 func (f fakeNomadClient) GetAllocation(allocationID string, query *api.QueryOptions) (*api.Allocation, *api.QueryMeta, error) {
+	if f.aclDenied {
+		return nil, nil, errACLDenied
+	}
 	return &api.Allocation{ID: allocationID, Namespace: f.namespace(), NodeID: "node-1", NodeName: "node-1", JobID: "example", ClientStatus: "running", TaskStates: map[string]*api.TaskState{"web": {State: "running"}}}, &api.QueryMeta{}, nil
 }
 func (f fakeNomadClient) GetAllocationChecks(allocationID string, query *api.QueryOptions) (api.AllocCheckStatuses, error) {
@@ -717,4 +725,52 @@ func TestToolsRejectMissingRequiredIDs(t *testing.T) {
 		must.True(t, ok)
 		must.StrContains(t, message.Text, testCase.argument+" is required")
 	}
+}
+
+// errACLDenied mirrors the raw error the Nomad API client returns for an ACL
+// denial; it carries the status code and server address.
+var errACLDenied = errors.New(`Unexpected response code: 403 (Permission denied) from https://10.0.0.1:4646`)
+
+const sanitizedACLMessage = "Nomad rejected the request due to insufficient ACL permissions."
+
+func TestResourceAndPromptErrorsAreSanitized(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSessionWith(t, fakeNomadClient{aclDenied: true})
+
+	// Resources and prompts return JSON-RPC errors rather than failResult, so they
+	// need the same sanitization as tools or the raw message reaches the client.
+	_, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://allocs/alloc-1/status"})
+	must.Error(t, err)
+	must.StrContains(t, err.Error(), sanitizedACLMessage)
+	must.StrNotContains(t, err.Error(), "10.0.0.1")
+
+	_, err = clientSession.GetPrompt(ctx, &mcp.GetPromptParams{
+		Name:      "debug_allocation",
+		Arguments: map[string]string{"alloc_id": "alloc-1", "task_name": "web"},
+	})
+	must.Error(t, err)
+	must.StrContains(t, err.Error(), sanitizedACLMessage)
+	must.StrNotContains(t, err.Error(), "10.0.0.1")
+
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "get_allocation", Arguments: map[string]any{"allocation_id": "alloc-1"}})
+	must.NoError(t, err)
+	must.True(t, result.IsError)
+	message, ok := result.Content[0].(*mcp.TextContent)
+	must.True(t, ok)
+	must.Eq(t, sanitizedACLMessage, message.Text)
+}
+
+func TestUnknownResourceKeepsNotFoundCode(t *testing.T) {
+	t.Parallel()
+
+	clientSession, ctx := newTestSession(t)
+
+	// Sanitization must not flatten structured JSON-RPC errors into plain text.
+	_, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "nomad://jobs/default/a/b/summary"})
+	must.Error(t, err)
+
+	var wireErr *jsonrpc.Error
+	must.True(t, errors.As(err, &wireErr))
+	must.Eq(t, mcp.CodeResourceNotFound, wireErr.Code)
 }

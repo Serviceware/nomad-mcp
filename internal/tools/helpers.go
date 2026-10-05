@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/hashicorp/nomad/api"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -206,14 +208,25 @@ func userFacingError(err error) string {
 	}
 
 	message := err.Error()
-	switch {
-	case strings.Contains(message, api.PermissionDeniedErrorContent):
+	if strings.Contains(message, api.PermissionDeniedErrorContent) {
 		return "Nomad rejected the request due to insufficient ACL permissions."
-	case strings.Contains(strings.ToLower(message), "not found"):
-		return message
-	default:
-		return message
 	}
+	return message
+}
+
+// sanitizedError applies userFacingError to errors returned from resource and
+// prompt handlers, which reach the client as JSON-RPC errors rather than
+// failResult. Structured JSON-RPC errors such as ResourceNotFoundError pass
+// through unchanged so their error code survives.
+func sanitizedError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var wireErr *jsonrpc.Error
+	if errors.As(err, &wireErr) {
+		return err
+	}
+	return errors.New(userFacingError(err))
 }
 
 func metaMap(queryMeta *api.QueryMeta) map[string]any {

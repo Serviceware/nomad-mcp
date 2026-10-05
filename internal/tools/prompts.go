@@ -9,8 +9,18 @@ import (
 	client "github.com/serviceware/nomad-mcp/internal/nomad"
 )
 
+// addPrompt registers a prompt whose handler errors are sanitized the same way
+// tool errors are, since prompts surface raw Nomad errors from the resources
+// they embed.
+func addPrompt(server *mcp.Server, prompt *mcp.Prompt, handler mcp.PromptHandler) {
+	server.AddPrompt(prompt, func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		result, err := handler(ctx, req)
+		return result, sanitizedError(err)
+	})
+}
+
 func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
-	server.AddPrompt(&mcp.Prompt{
+	addPrompt(server, &mcp.Prompt{
 		Name:        "debug_allocation",
 		Title:       "Debug Allocation",
 		Description: "Analyze an allocation failure or crash using status, checks, and a bounded log tail.",
@@ -71,6 +81,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 				contents.Meta = mcp.Meta{
 					"requested_lines": logTail.RequestedLines,
 					"applied_lines":   logTail.AppliedLines,
+					"returned_lines":  logTail.ReturnedLines,
 					"returned_bytes":  logTail.ReturnedBytes,
 					"truncated":       logTail.Truncated,
 				}
@@ -81,7 +92,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		return &mcp.GetPromptResult{Description: "Allocation debugging workflow", Messages: messages}, nil
 	})
 
-	server.AddPrompt(&mcp.Prompt{
+	addPrompt(server, &mcp.Prompt{
 		Name:        "explain_evaluation",
 		Title:       "Explain Evaluation",
 		Description: "Explain why a Nomad evaluation failed to place allocations.",
@@ -106,7 +117,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}, nil
 	})
 
-	server.AddPrompt(&mcp.Prompt{
+	addPrompt(server, &mcp.Prompt{
 		Name:        "diagnose_deployment",
 		Title:       "Diagnose Deployment",
 		Description: "Analyze a deployment rollout and identify blockers or regressions.",
@@ -131,7 +142,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}, nil
 	})
 
-	server.AddPrompt(&mcp.Prompt{
+	addPrompt(server, &mcp.Prompt{
 		Name:        "investigate_node",
 		Title:       "Investigate Node",
 		Description: "Review node health, drain status, and current placements.",
@@ -161,7 +172,7 @@ func RegisterPrompts(server *mcp.Server, nomadClient client.Facade) {
 		}, nil
 	})
 
-	server.AddPrompt(&mcp.Prompt{
+	addPrompt(server, &mcp.Prompt{
 		Name:        "explain_job",
 		Title:       "Explain Job",
 		Description: "Summarize a Nomad job's configuration, runtime state, and recent scheduler activity.",
