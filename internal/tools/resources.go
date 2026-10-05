@@ -31,7 +31,8 @@ func RegisterResources(server *mcp.Server, nomadClient client.Facade) {
 		MIMEType:    "application/json",
 		URI:         nomadClusterSummaryURI,
 	}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		return readNomadResource(ctx, nomadClient, req.Params.URI)
+		result, err := readNomadResource(ctx, nomadClient, req.Params.URI)
+		return result, sanitizedError(err)
 	})
 
 	for _, template := range []*mcp.ResourceTemplate{
@@ -107,7 +108,8 @@ func RegisterResources(server *mcp.Server, nomadClient client.Facade) {
 		},
 	} {
 		server.AddResourceTemplate(template, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-			return readNomadResource(ctx, nomadClient, req.Params.URI)
+			result, err := readNomadResource(ctx, nomadClient, req.Params.URI)
+			return result, sanitizedError(err)
 		})
 	}
 }
@@ -433,6 +435,7 @@ func allocationLogsResource(ctx context.Context, nomadClient client.Facade, uri 
 			"stream":          logTail.LogType,
 			"requested_lines": logTail.RequestedLines,
 			"applied_lines":   logTail.AppliedLines,
+			"returned_lines":  logTail.ReturnedLines,
 			"returned_bytes":  logTail.ReturnedBytes,
 			"truncated":       logTail.Truncated,
 		}

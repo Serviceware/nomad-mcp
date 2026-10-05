@@ -55,3 +55,13 @@ func TestTrimLogTailRespectsRequestedLinesOnLargeInput(t *testing.T) {
 	trimmed := trimLogTail(builder.String(), 200, true)
 	must.Eq(t, 200, strings.Count(trimmed, "\n"))
 }
+
+func TestCountLines(t *testing.T) {
+	t.Parallel()
+
+	must.Eq(t, 0, countLines(""))
+	must.Eq(t, 1, countLines("one"))
+	must.Eq(t, 1, countLines("one\n"))
+	must.Eq(t, 2, countLines("one\ntwo"))
+	must.Eq(t, 2, countLines("one\ntwo\n"))
+}
