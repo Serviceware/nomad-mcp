@@ -55,7 +55,27 @@ func (fakeNomadClient) GetJob(jobID string, query *api.QueryOptions) (*api.Job, 
 	stable := true
 	stop := false
 	submitTime := int64(1)
-	return &api.Job{ID: &jobID, Name: &jobName, Namespace: &namespace, Type: &jobType, Priority: &priority, Version: &version, Stable: &stable, Stop: &stop, SubmitTime: &submitTime}, &api.QueryMeta{}, nil
+	tgName := "web"
+	return &api.Job{
+		ID: &jobID, Name: &jobName, Namespace: &namespace, Type: &jobType,
+		Priority: &priority, Version: &version, Stable: &stable, Stop: &stop, SubmitTime: &submitTime,
+		TaskGroups: []*api.TaskGroup{
+			{
+				Name: &tgName,
+				Networks: []*api.NetworkResource{
+					{
+						Mode:          "bridge",
+						ReservedPorts: []api.Port{{Label: "http", Value: 80, To: 8080}},
+						DynamicPorts:  []api.Port{{Label: "metrics", To: 9090}},
+					},
+				},
+				Tasks: []*api.Task{
+					{Name: "nginx", Driver: "docker", Config: map[string]interface{}{"image": "nginx:alpine"}},
+					{Name: "agent", Driver: "docker", Config: map[string]interface{}{"image": "consul:latest"}},
+				},
+			},
+		},
+	}, &api.QueryMeta{}, nil
 }
 func (fakeNomadClient) GetJobScaleStatus(jobID string, query *api.QueryOptions) (*api.JobScaleStatusResponse, *api.QueryMeta, error) {
 	return &api.JobScaleStatusResponse{JobID: jobID, Namespace: "default", TaskGroups: map[string]api.TaskGroupScaleStatus{"cache": {Desired: 1, Placed: 1, Running: 1, Healthy: 1, Unhealthy: 0}}}, &api.QueryMeta{}, nil
@@ -369,4 +389,85 @@ func TestListRegionsToolSchemaIncludesProperties(t *testing.T) {
 		t.Fatalf("get_job job_id property has unexpected type %T", getJobProperties["job_id"])
 	}
 	must.Eq(t, "full Nomad job ID", jobIDProperty["description"])
+}
+
+func TestGetJobIncludesTaskGroupsWithNetworksAndTasks(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(fakeNomadClient{}, logger)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
+
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	must.NoError(t, err)
+	defer serverSession.Close()
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	must.NoError(t, err)
+	defer clientSession.Close()
+
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "get_job", Arguments: map[string]any{"job_id": "example"}})
+	must.NoError(t, err)
+	must.False(t, result.IsError)
+
+	structured, ok := result.StructuredContent.(map[string]any)
+	must.True(t, ok)
+
+	job, ok := structured["job"].(map[string]any)
+	must.True(t, ok)
+
+	taskGroups, ok := job["task_groups"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, taskGroups)
+
+	tg, ok := taskGroups[0].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "web", tg["name"])
+
+	networks, ok := tg["networks"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, networks)
+
+	network, ok := networks[0].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "bridge", network["mode"])
+
+	reservedPorts, ok := network["reserved_ports"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, reservedPorts)
+
+	port, ok := reservedPorts[0].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "http", port["label"])
+	must.Eq(t, float64(80), port["value"].(float64))
+	must.Eq(t, float64(8080), port["to"].(float64))
+
+	dynamicPorts, ok := network["dynamic_ports"].([]any)
+	must.True(t, ok)
+	must.Len(t, 1, dynamicPorts)
+
+	dynPort, ok := dynamicPorts[0].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "metrics", dynPort["label"])
+	must.Eq(t, float64(9090), dynPort["to"].(float64))
+
+	tasks, ok := tg["tasks"].([]any)
+	must.True(t, ok)
+	must.Len(t, 2, tasks)
+
+	nginxTask, ok := tasks[0].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "nginx", nginxTask["name"])
+	must.Eq(t, "docker", nginxTask["driver"])
+	must.Eq(t, "nginx:alpine", nginxTask["image"])
+
+	agentTask, ok := tasks[1].(map[string]any)
+	must.True(t, ok)
+	must.Eq(t, "agent", agentTask["name"])
+	must.Eq(t, "docker", agentTask["driver"])
+	must.Eq(t, "consul:latest", agentTask["image"])
 }

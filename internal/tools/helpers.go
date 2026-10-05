@@ -309,6 +309,66 @@ func summarizeList(kind string, count int, queryMeta *api.QueryMeta) string {
 	return fmt.Sprintf("Returned %d %s.", count, kind)
 }
 
+func taskGroupsMap(groups []*api.TaskGroup) []map[string]any {
+	items := make([]map[string]any, 0, len(groups))
+	for _, tg := range groups {
+		if tg == nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"name":     derefString(tg.Name),
+			"networks": networksMap(tg.Networks),
+			"tasks":    tasksMap(tg.Tasks),
+		})
+	}
+	return items
+}
+
+func networksMap(networks []*api.NetworkResource) []map[string]any {
+	items := make([]map[string]any, 0, len(networks))
+	for _, n := range networks {
+		if n == nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"mode":           n.Mode,
+			"reserved_ports": portsMap(n.ReservedPorts),
+			"dynamic_ports":  portsMap(n.DynamicPorts),
+		})
+	}
+	return items
+}
+
+func portsMap(ports []api.Port) []map[string]any {
+	items := make([]map[string]any, 0, len(ports))
+	for _, p := range ports {
+		items = append(items, map[string]any{
+			"label": p.Label,
+			"value": p.Value,
+			"to":    p.To,
+		})
+	}
+	return items
+}
+
+func tasksMap(tasks []*api.Task) []map[string]any {
+	items := make([]map[string]any, 0, len(tasks))
+	for _, t := range tasks {
+		if t == nil {
+			continue
+		}
+		item := map[string]any{
+			"name":   t.Name,
+			"driver": t.Driver,
+		}
+		if image, ok := t.Config["image"]; ok {
+			item["image"] = image
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
 func serviceRegistrationMap(service *api.ServiceRegistration) map[string]any {
 	if service == nil {
 		return map[string]any{}
