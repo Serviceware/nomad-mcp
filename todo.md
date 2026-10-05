@@ -14,10 +14,14 @@ Review snapshot of the read-only Nomad MCP server. Build, `go vet`, `gofmt -l`, 
   These three calls accept and thread no context, breaking the "always thread context" invariant
   in CLAUDE.md. Plumb a `context.Context` through them.
 
-- [ ] **Error-message sanitization is inconsistent across surfaces** — resources/prompts return
+- [x] **Error-message sanitization is inconsistent across surfaces** — resources/prompts return
   raw Go errors straight from the Nomad API (e.g. `internal/tools/resources.go:185-194`), while
   tools sanitize via `failResult` + `userFacingError`. Raw API errors can leak addresses / ACL
   details on the resource and prompt paths. Align the error contract across tools, resources, prompts.
+  Resolved: resource handlers and `addPrompt` route errors through `sanitizedError`; structured
+  JSON-RPC errors (e.g. `ResourceNotFoundError`) pass through with their code intact. Note that
+  `userFacingError` only rewrites ACL denials — other API errors (e.g. `unknown task name`) still
+  surface verbatim on every surface.
 
 - [ ] **`GetAllocationLogs` error propagation is best-effort** — `internal/nomad/client.go:207-241`
   After the `for frame := range frames` loop drains, a late error delivered on `errCh` is dropped
@@ -67,7 +71,7 @@ Review snapshot of the read-only Nomad MCP server. Build, `go vet`, `gofmt -l`, 
 
 - [x] **Duplicate identical helpers** — `formatSubmitTime` and `formatUnixNanos` were byte-for-byte
   identical. Consolidated onto `formatUnixNanos`.
-- [ ] **`userFacingError` "not found" branch is a no-op** — returns `message` unchanged, identical
+- [x] **`userFacingError` "not found" branch is a no-op** — returns `message` unchanged, identical
   to `default` (`internal/tools/helpers.go:192-195`).
 - [ ] **Leftover compile-anchor** — `var _ = api.AllNamespacesNamespace` (`internal/tools/cluster.go:177`)
   is a no-op; replace with a real comment or remove.

@@ -17,7 +17,10 @@ type AllocationLogTail struct {
 	Text           string
 	RequestedLines int
 	AppliedLines   int
-	ReturnedBytes  int
+	// ReturnedLines is how many lines Text actually holds. It can be well below
+	// AppliedLines when long lines exhaust the byte budget first.
+	ReturnedLines int
+	ReturnedBytes int
 	// Truncated reports that Text is not the complete requested tail: either the
 	// request exceeded maxLogTailLines, or the byte budget clipped the start of it.
 	Truncated bool
@@ -229,6 +232,7 @@ func (c *Client) GetAllocationLogs(allocationID string, taskName string, logType
 			Text:           text,
 			RequestedLines: lines,
 			AppliedLines:   appliedLines,
+			ReturnedLines:  countLines(text),
 			ReturnedBytes:  len(text),
 			Truncated:      truncated || clipped,
 			LogType:        logType,
@@ -277,6 +281,18 @@ func trimLogTail(text string, lines int, clipped bool) string {
 		}
 	}
 	return lastLines(text, lines)
+}
+
+// countLines counts lines in text, including a final line with no trailing newline.
+func countLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	count := strings.Count(text, "\n")
+	if !strings.HasSuffix(text, "\n") {
+		count++
+	}
+	return count
 }
 
 // lastLines returns the trailing n lines of text, preserving whether the input
