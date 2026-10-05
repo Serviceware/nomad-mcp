@@ -5,6 +5,9 @@
 > [!NOTE]
 > This project was developed via agentic / vibe coding
 
+**Getting started:** see [QUICKSTART.md](QUICKSTART.md) to add the server to Claude Code or Claude
+Desktop, either as a prebuilt binary or with `go run` from a checkout, including TLS setup.
+
 ## Scope
 
 The initial implementation targets `stdio` transport and read-only inspection workflows.
